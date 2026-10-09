@@ -159,6 +159,115 @@ end
     sprintf('对比 %d 个谐波 (M=0.35/0.8/1.0), max rel err = %.3e %s', ...
     nCmpB, maxRelB, badB), nPass, nFail);
 
+%% ================= 死区 (dead time) 相关验证 =================
+fprintf('\n  ---- 死区功能验证 (td = 4us) ----\n');
+tdv = 4e-6;
+Rl  = 0.5;  Ll = 2e-3;
+Rdt = hbridge_spwm_harmonics(fc, f0, Vdc, Mp, Ncyc=10, Kmax=2000, ...
+        Tdead=tdv, Rload=Rl, Lload=Ll, UseSampledFFT=true, DT=1e-6, Verbose=false);
+Ri  = hbridge_spwm_harmonics(fc, f0, Vdc, Mp, Ncyc=10, Kmax=2000, ...
+        Tdead=0, Rload=Rl, Lload=Ll, UseSampledFFT=false, Verbose=false);
+
+% D1: td=0 必须与无死区结果完全一致 (向后兼容)
+Rz = hbridge_spwm_harmonics(fc, f0, Vdc, Mp, Ncyc=2, Kmax=500, Tdead=0, ...
+        Rload=Rl, Lload=Ll, UseSampledFFT=false, Verbose=false);
+Rr0 = hbridge_spwm_harmonics(fc, f0, Vdc, Mp, Ncyc=2, Kmax=500, ...
+        Rload=Rl, Lload=Ll, UseSampledFFT=false, Verbose=false);
+d0 = max(abs(Rz.Amp - Rr0.Amp));
+[nPass,nFail] = chk('D1  td=0 与无死区模型完全一致', d0 < 1e-9*Vdc, ...
+    sprintf('max|dA| = %.3e V', d0), nPass, nFail);
+
+% D2: 死区由 0 变为 4us 后, 低次谐波必须从 ~0 抬升到已知量级
+[nPass,nFail] = chk('D2  死区使 3/5/7 次谐波出现 (原为 0)', ...
+    all([Ri.Amp(3) Ri.Amp(5) Ri.Amp(7)] < 1e-9*Vdc) && ...
+    all([Rdt.Amp(3) Rdt.Amp(5) Rdt.Amp(7)] > 0.05), ...
+    sprintf('无死区 %.1e/%.1e/%.1e V -> 含死区 %.4f/%.4f/%.4f V', ...
+    Ri.Amp(3), Ri.Amp(5), Ri.Amp(7), Rdt.Amp(3), Rdt.Amp(5), Rdt.Amp(7)), ...
+    nPass, nFail);
+
+% D3: 死区谐波的两条规律
+%   (i)  1/h 律: 低次时 A_h * h 近似为常数 (死区误差近似 ±2*td*fc*Vdc 的方波)。
+%        由于死区误差还受"斩波活动包络"缓慢调制, A_h*h 会随 h 缓慢上升,
+%        实测 h=3..15 离散度约 2.2%, h=3..25 约 6.6%, 故 1/h 律只在低次严格成立。
+%   (ii) 幅值量级与闭式解 8*td*fc*Vdc/(pi*h) 相符(偏差同样随 h 缓慢增大)。
+hLaw   = 3:2:15;
+prodH  = Rdt.Amp(hLaw) .* hLaw.';
+spread = max(prodH)/min(prodH) - 1;
+prodAll = Rdt.Amp(3:2:25) .* (3:2:25).';
+[nPass,nFail] = chk('D3a 低次死区谐波满足 1/h 律 (h<=15, <3%)', spread < 0.03, ...
+    sprintf('h=3..15: A_h*h = %.4f~%.4f V (离散 %.3f %%); h<=25 离散 %.2f %%', ...
+    min(prodH), max(prodH), 100*spread, ...
+    100*(max(prodAll)/min(prodAll)-1)), nPass, nFail);
+
+envD = 8*tdv*fc*Vdc ./ (pi*hLaw.');
+relD = abs(Rdt.Amp(hLaw) - envD) ./ envD;
+[nPass,nFail] = chk('D3b 与闭式包络 8*td*fc*Vdc/(pi*h) 量级相符 (<7%)', ...
+    max(relD) < 0.07, ...
+    sprintf('h=3: %.3f%%, h=15: %.3f%%, h=25: %.3f%% (包络近似, 随 h 增大)', ...
+    100*relD(1), 100*relD(7), 100*relD(end)), nPass, nFail);
+
+% D4: 每载波周期平均误差电压 = 2*td*fc*Vdc (逐周期核对, 用门极状态直接算)
+Tc = 1/fc;
+errAvg = [];
+for kk = [3 8 16 24 32 40 45]
+    t0 = kk*Tc; t1 = t0 + Tc;
+    if t1 > Ri.T, continue; end
+    tg2 = linspace(t0, t1, 20001).';
+    vI = Vdc*spwm_out_level(tg2, fc, f0, Mp);
+    vD = Vdc*spwm_deadtime_out_level(tg2, fc, f0, Mp, tdv, Rdt.deadtime.phi_rad);
+    errAvg(end+1) = mean(vD - vI); %#ok<SAGROW>
+end
+nz = abs(errAvg) > 0.1;
+maxdev = max(abs(abs(errAvg(nz)) - 2*tdv*fc*Vdc));
+[nPass,nFail] = chk('D4  逐载波周期平均误差 = ±2*td*fc*Vdc', ...
+    any(nz) && maxdev < 0.02*2*tdv*fc*Vdc, ...
+    sprintf('实测 %.4f V, 理论 %.4f V, 最大偏差 %.4f V', ...
+    mean(abs(errAvg(nz))), 2*tdv*fc*Vdc, maxdev), nPass, nFail);
+
+% D5: 死区谐波随 td 严格线性
+A3a = zeros(1,3); tdl = [2e-6 4e-6 8e-6];
+for i = 1:3
+    Rx = hbridge_spwm_harmonics(fc, f0, Vdc, Mp, Ncyc=2, Kmax=500, Tdead=tdl(i), ...
+        Rload=Rl, Lload=Ll, UseSampledFFT=false, Verbose=false);
+    A3a(i) = Rx.Amp(3);
+end
+lin = max(abs(A3a ./ (tdl/tdl(1)) / A3a(1) - 1));
+[nPass,nFail] = chk('D5  死区谐波与 td 严格线性 (<0.3%)', lin < 3e-3, ...
+    sprintf('A3 = %.5f/%.5f/%.5f V, 归一化偏差 %.3e', A3a, lin), nPass, nFail);
+
+% D6: 含死区时半波对称性保持 (偶次谐波仍为 0)
+evenD = max(Rdt.Amp(2:2:end));
+[nPass,nFail] = chk('D6  含死区仍只有奇次谐波', evenD < 1e-9*Vdc, ...
+    sprintf('max even = %.3e V', evenD), nPass, nFail);
+
+% D7: 电流方向自洽迭代收敛, 且与含死区的细采样FFT交叉验证
+A_fineD = fft_harmonics_dt(fc, f0, Vdc, Mp, 1, 2e-8, 600, tdv, Rdt.deadtime.phi_rad);
+sigD = Rdt.Amp(1:600) > 0.01*Vdc & Rdt.freq(1:600) <= 20000;
+relD2 = abs(A_fineD(sigD) - Rdt.Amp(sigD)) ./ Rdt.Amp(sigD);
+[nPass,nFail] = chk('D7  含死区: 20ns细采样FFT交叉验证', ...
+    Rdt.deadtime.converged && max(relD2) < 1e-2, ...
+    sprintf('收敛=%d; n=%d, max rel err = %.3f %%', Rdt.deadtime.converged, ...
+    nnz(sigD), 100*max(relD2)), nPass, nFail);
+
+% D8: 门极互锁与死区窗口宽度 (无直通, 每个死区窗口宽度 = td)
+tg3 = linspace(0.004, 0.004+4*Tc, 400001).';
+[g1,g2,g3,g4, dLg, dRg] = spwm_gate_states(tg3, fc, f0, Mp, tdv);
+dtw = tg3(2)-tg3(1);
+wins = local_window_widths(dLg, dtw);
+winsR = local_window_widths(dRg, dtw);
+[nPass,nFail] = chk('D8  同臂无直通且死区窗口宽度 = td', ...
+    all((g1&g2)==0) && all((g3&g4)==0) && ~isempty(wins) && ...
+    max(abs([wins; winsR] - tdv)) < 2*dtw, ...
+    sprintf('直通=0; 左臂 %d 个窗口 %.3f~%.3f us, 右臂 %d 个 (td=%.3f us)', ...
+    numel(wins), min(wins)*1e6, max(wins)*1e6, numel(winsR), tdv*1e6), ...
+    nPass, nFail);
+
+% D9: 死区造成基波幅值下降 (物理上必然)
+[nPass,nFail] = chk('D9  死区使基波幅值下降', ...
+    Rdt.Amp(1) < Ri.Amp(1) && Rdt.A1_drop_pct > 0.5, ...
+    sprintf('A1: %.6f -> %.6f V (下降 %.4f %%)', ...
+    Ri.Amp(1), Rdt.Amp(1), Rdt.A1_drop_pct), nPass, nFail);
+
 %% ---------------- 汇总 ----------------
 log('----------------------------------------------------------------');
 log('   通过 %d 项, 失败 %d 项', nPass, nFail);
@@ -190,6 +299,31 @@ N = round(T/DT);
 dt = T/N;
 t = (0:N-1).' * dt;
 Vout = Vdc * spwm_out_level(t, fc, f0, M);
+Y = fft(Vout);
+half = floor(N/2);
+mag = 2*abs(Y(1:half+1)) / N;
+mag(1) = abs(Y(1)) / N;
+A = nan(Kmax,1);
+idx = (1:Kmax).' * Ncyc + 1;
+ok = idx <= half + 1;
+A(ok) = mag(idx(ok));
+end
+
+function w = local_window_widths(flag, dtw)
+% 提取逻辑量 flag 中所有 "1" 连续段的宽度 (秒)
+d = diff([0; flag(:); 0]);
+st = find(d == 1);      % 段起始
+en = find(d == -1);     % 段结束
+w = (en - st) * dtw;
+end
+
+function A = fft_harmonics_dt(fc, f0, Vdc, M, Ncyc, DT, Kmax, td, phi)
+% 独立方法 D: 含死区波形的等步长采样 + FFT
+T = Ncyc/f0;
+N = round(T/DT);
+dt = T/N;
+t = (0:N-1).' * dt;
+Vout = Vdc * spwm_deadtime_out_level(t, fc, f0, M, td, phi);
 Y = fft(Vout);
 half = floor(N/2);
 mag = 2*abs(Y(1:half+1)) / N;

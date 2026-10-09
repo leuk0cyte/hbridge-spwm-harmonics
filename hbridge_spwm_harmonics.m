@@ -10,6 +10,14 @@ function R = hbridge_spwm_harmonics(fc, f0, Vdc, M, opts)
 %      Vout  = Vdc*(Q1 - Q3) = Vdc * sign(v) .* (|v| > |c|)
 %  即三电平输出 {+Vdc, 0, -Vdc}, 零电平段为续流。
 %
+%  死区 (opts.Tdead, 例如 4e-6 = 4us):
+%     开通延迟 td / 关断立即; 死区期间桥臂电位由续流二极管按电流方向钳位。
+%     每个载波周期的平均误差电压为 dV = -2*sign(i)*td*fc*Vdc (两个桥臂都斩波)。
+%     后果: 原本严格为 0 的 3、5、7... 次谐波出现(幅值 ~ 8*td*fc*Vdc/(pi*h)),
+%           基波幅值下降(约为 dV 的基波分量), 窄脉冲(< td)丢失。
+%     电流方向由"电压谐波 -> R-L 电流"自洽迭代确定; 无负载信息时按基波
+%     sin(2*pi*f0*t - phi0) 的符号近似(phi0 = atan(2*pi*f0*L/R))。
+%
 %  谐波计算提供两种互相独立、可交叉验证的方法:
 %    (1) 精确法 : 解析求出每个开关跳变时刻(二分法收敛到机器精度),
 %                 再把分段常数波形逐段解析积分得到傅里叶系数。
@@ -36,6 +44,9 @@ function R = hbridge_spwm_harmonics(fc, f0, Vdc, M, opts)
 %
 %  说明: 当 fc/f0 为偶数整数时, 输出波形具有半波对称性, 只存在奇次谐波。
 %
+%  用法(死区):
+%      R = hbridge_spwm_harmonics(2400, 50, 100, 0.8, Tdead=4e-6, Rload=0.5, Lload=2e-3);
+%
 %  作者: 谐波分析工具 (MATLAB R2025b)
 %  日期: 2026
 %
@@ -52,7 +63,8 @@ arguments
     opts.DT    (1,1) double {mustBePositive} = 1e-6               % 采样步长 s
     opts.Kmax  (1,1) double {mustBePositive, mustBeInteger} = 4000 % 最高谐波次数
     opts.Rload (1,1) double {mustBeNonnegative} = 0               % 负载电阻 ohm
-    opts.Lload (1,1) double {mustBeNonnegative} = 0               % 负载电感 H
+    opts.Lload (1,1) double {mustBeNonnegative} = 0                % 负载电感 H
+    opts.Tdead (1,1) double {mustBeNonnegative} = 0                % 固定开关死区 s (如 4e-6)
     opts.UseSampledFFT (1,1) logical = true
     opts.Verbose       (1,1) logical = true
 end
@@ -74,9 +86,23 @@ if ~R.isPeriodicRecord
         opts.Ncyc, opts.Ncyc*ratio);
 end
 R.Rload = opts.Rload; R.Lload = opts.Lload;
+R.Tdead = opts.Tdead;
+R.td_over_Tc = opts.Tdead * fc;        % 死区占载波周期的比例
+R.td_periods = opts.Tdead * fc;        % 每开关周期损失的有效导通比例
 
 % ================= 1) 精确法 =================
-[tr, segA, segB, segLev] = exact_waveform(fc, f0, M, Vdc, T);
+if opts.Tdead > 0
+    % 含死区: 断点=各桥臂跳变时刻 ∪ (跳变+td) ∪ 电流过零点; 电流符号自洽迭代
+    phi0 = atan2(2*pi*f0*opts.Lload, max(opts.Rload, eps));
+    [tr, segA, segB, segLev, dtinfo] = ...
+        exact_waveform_deadtime(fc, f0, M, Vdc, T, opts.Tdead, phi0, ...
+                                opts.Rload, opts.Lload, opts.Kmax);
+    R.deadtime = dtinfo;
+else
+    [tr, segA, segB, segLev] = exact_waveform(fc, f0, M, Vdc, T);
+    R.deadtime = struct('converged', true, 'nIter', 0, 'iterated', false, ...
+                        'phi_deg', NaN);
+end
 [ck, ck0] = exact_fourier(segA, segB, segLev, T, f0, opts.Kmax);
 
 R.exact.transitions = tr;
@@ -106,8 +132,19 @@ else
 end
 
 % ---- 基波理论值 ----
-R.A1_theory = M * Vdc;                       % 线性调制区: A1 = M*Vdc
+R.A1_theory = M * Vdc;                       % 线性调制区(无死区): A1 = M*Vdc
 R.A1_error  = abs(R.Amp(1) - R.A1_theory);
+R.A1_drop   = R.A1_theory - R.Amp(1);        % 死区造成的基波损失
+R.A1_drop_pct = 100 * R.A1_drop / R.A1_theory;
+
+% ---- 死区引入的低次谐波 (理想时严格为 0) ----
+if opts.Tdead > 0
+    R.deadtime.dV_per_Tc = 2 * opts.Tdead * fc * Vdc;    % 每载波周期平均误差幅值
+    R.deadtime.low_order_est = zeros(0,2);
+    lo = 3:2:min(25, opts.Kmax);
+    est = 8 * opts.Tdead * fc * Vdc ./ (pi * lo).^1;      % 8*td*fc*Vdc/(pi*h)
+    R.deadtime.low_order_est = [lo(:), est(:), R.Amp(lo)];
+end
 
 % ---- 负载电流谐波 (把输出看成经 R-L 负载的电压源) ----
 if opts.Rload > 0
@@ -121,12 +158,31 @@ else
     R.THD_i_50 = NaN; R.THD_i_2fc = NaN; R.THD_i_all = NaN;
 end
 
+% ---- 死区"电流方向由基波决定"假设的量化核对 ----
+if opts.Tdead > 0
+    if opts.Rload > 0
+        tg = linspace(0, T, 20001).';            % 固定网格, 便于跨工况比较
+        iFull = local_current_eval(tg, ck, opts.Rload, opts.Lload, 2*pi*f0);
+        upFull = iFull > 0;
+        upFund = sin(2*pi*f0*tg - R.deadtime.phi_rad) > 0;
+        R.deadtime.sign_mismatch_pct = 100 * mean(upFull ~= upFund);
+    else
+        R.deadtime.sign_mismatch_pct = NaN;
+    end
+    R.deadtime.phi_rad_final = R.deadtime.phi_rad;
+end
+
 % ================= 2) 采样FFT法 (复现原Python仿真) =================
 if opts.UseSampledFFT
     N  = round(T / opts.DT);
     dt = T / N;                        % 保证恰好 Ncyc 个整基波周期
     t  = (0:N-1).' * dt;
-    Vout = Vdc * spwm_out_level(t, fc, f0, M);
+    if opts.Tdead > 0
+        Vout = Vdc * spwm_deadtime_out_level(t, fc, f0, M, opts.Tdead, ...
+                                             R.deadtime.phi_rad);
+    else
+        Vout = Vdc * spwm_out_level(t, fc, f0, M);
+    end
 
     Y    = fft(Vout);
     half = floor(N/2);
@@ -176,6 +232,104 @@ if opts.Verbose
     local_verbose(R);
 end
 end % ====================== 主函数结束 ======================
+
+% ------------------------------------------------------------------
+%  含死区的精确波形 (分段常数)
+%    死区模型: 开通延迟 td / 关断立即, 死区期间由续流二极管按电流方向钳位
+%    断点集合 = 各桥臂理想跳变时刻 ∪ (跳变时刻+td) ∪ 电流过零点
+%
+%    电流方向的自洽条件: 续流钳位取决于电流符号, 而电流又由(含死区的)电压
+%    决定。由于 R-L 负载把开关纹波滤得很干净, 电流过零点几乎完全由**基波**
+%    决定, 故以基波滞后相位 phi 为自洽变量做标量固定点迭代(收敛快且良态):
+%        phi = angle(Z1) - angle(ck_1) - pi/2
+%    其中 angle(ck_1) 是含死区后输出电压基波的相位。(开关纹波确实会在基波
+%    过零附近使电流在载波周期内来回变号, 这属于"过零畸变"区域; 本模型用基波
+%    方向表示该区域, 并用 sign_mismatch 指标量化该近似的误差。)
+% ------------------------------------------------------------------
+function [tr, segA, segB, segLev, info] = exact_waveform_deadtime( ...
+        fc, f0, M, Vdc, T, td, phi0, Rload, Lload, Kmax) %#ok<INUSD>
+t1 = -2*td;  t2 = T;
+[eAll, eL, eR] = spwm_ideal_edges(fc, f0, M, t1, t2);
+
+inT = @(x) x(x >= 0 & x <= T);
+brkBase = unique([0; inT(eAll); inT(eL) + td; inT(eR) + td; T]);
+brkBase = brkBase(brkBase >= 0 & brkBase <= T);
+
+Z1ang    = angle(Rload + 1j*2*pi*f0*Lload);      % 基波阻抗角
+w        = 2*pi*f0;
+phi      = phi0;
+iterated = Rload > 0;
+converged = ~iterated;
+nIter = 0;
+maxIter = 15;
+tol = 1e-9;                                      % rad
+
+for it = 1:maxIter
+    nIter = it;
+    brk = unique([brkBase; local_crossings(phi, w, T)]);
+    brk = sort(brk(:));
+    a = brk(1:end-1);  b = brk(2:end);
+    keep = (b - a) > 0;
+    a = a(keep);  b = b(keep);
+    if isempty(a)
+        a = 0; b = T;
+    end
+    lev = Vdc * spwm_deadtime_out_level((a + b)/2, fc, f0, M, td, phi);
+
+    if ~iterated
+        break                                    % 无负载信息: 用基波符号, 不迭代
+    end
+    % 只需基波相位即可更新 phi (不必算全谱, 因此迭代代价极小)
+    ck1 = exact_fourier(a, b, lev, T, f0, 1);
+    phiNew = Z1ang - angle(ck1(1)) - pi/2;
+    d = mod(phiNew - phi + pi, 2*pi) - pi;       % 归一化到 (-pi, pi]
+    phi = phi + 0.8*d;                           % 松弛迭代
+    if abs(d) < tol
+        converged = true; break
+    end
+end
+
+segA = a; segB = b; segLev = lev;
+tr = unique([0; segA(:); segB(:); T]);
+
+info = struct();
+info.converged   = converged;
+info.iterated    = iterated;
+info.nIter       = nIter;
+info.td          = td;
+info.phi_rad     = phi;
+info.phi_deg     = phi * 180/pi;
+info.phi0_deg    = angle(Rload + 1j*2*pi*f0*Lload) * 180/pi;
+info.nEdges      = numel(eAll);
+info.nSegments   = numel(segA);
+end
+
+% ------------------------------------------------------------------
+%  基波电流的过零点 (解析):  sin(2*pi*f0*t - phi) = 0
+% ------------------------------------------------------------------
+function tz = local_crossings(phi, w, T)
+k1 = ceil((-phi)/pi);
+k2 = floor((w*T - phi)/pi);
+tz = ((k1:k2).' * pi + phi) / w;
+tz = tz(tz > 0 & tz < T);
+end
+
+% ------------------------------------------------------------------
+%  由电压谐波系数重建 R-L 负载电流 (相量法), 用于核对电流方向假设
+%     v_h(t) = 2*Re(ck_h e^{j h w t});  i_h = v_h / (R + j h w L)
+% ------------------------------------------------------------------
+function i = local_current_eval(t, ck, R, L, w)
+Ih = ck ./ (R + 1j*(1:numel(ck)).'*w*L);
+t  = t(:).';
+i  = zeros(size(t));
+hh = (1:numel(Ih)).';
+blk = 400;                                       % 分块, 控制内存
+for i0 = 1:blk:numel(Ih)
+    idx = i0:min(i0+blk-1, numel(Ih));
+    i = i + (2*Ih(idx)).' * exp(1j*(w*hh(idx))*t);   % (1xn)*(nxNt) = 1xNt
+end
+i = i(:);
+end
 
 % ------------------------------------------------------------------
 %  精确波形: 求跳变时刻 + 分段常数表示
@@ -270,6 +424,10 @@ fprintf('\n');
 fprintf('=========== H桥单极性SPWM 输出电压谐波分析 (精确解析法) ===========\n');
 fprintf('  载波(开关)频率 fc : %g Hz\n', R.fc);
 fprintf('  基波频率     f0  : %g Hz\n', R.f0);
+if R.Tdead > 0
+    fprintf('  开关死区     td  : %g us  (占载波周期 %.2f %%)\n', ...
+        R.Tdead*1e6, 100*R.td_over_Tc);
+end
 fprintf('  载波比     fc/f0 : %g %s\n', R.carrierRatio, ...
     ternary(R.isIntegerRatio, '(整数: 仅奇次谐波, 纯正弦级数)', '(非整数!)'));
 if ~R.isPeriodicRecord
@@ -282,6 +440,30 @@ fprintf('  分析时长         : %g ms (%d 个基波周期, %g 个开关周期)
 fprintf('  精确跳变时刻数   : %d\n', R.exact.nTransitions);
 fprintf('  基波幅值 A1      : %.6f V  (理论 M*Vdc = %.6f V, 误差 %.2e V)\n', ...
     R.Amp(1), R.A1_theory, R.A1_error);
+if R.Tdead > 0
+    fprintf('  ---- 死区影响 (td = %g us) ----\n', R.Tdead*1e6);
+    fprintf('  每载波周期平均误差电压        : %.4f V  (= 2*td*fc*Vdc)\n', ...
+        R.deadtime.dV_per_Tc);
+    fprintf('  基波损失                      : %.4f V (%.4f %%)\n', ...
+        R.A1_drop, R.A1_drop_pct);
+    if R.deadtime.iterated
+        fprintf('  电流方向自洽迭代(基波相位)    : %d 次, %s (phi = %.3f deg)\n', ...
+            R.deadtime.nIter, ternary(R.deadtime.converged, '已收敛', '未收敛(!)'), ...
+            R.deadtime.phi_deg);
+        if isfinite(R.deadtime.sign_mismatch_pct)
+            fprintf('  电流符号假设偏差(全谐波核对)  : %.4f %% (纹波在过零附近改变方向)\n', ...
+                R.deadtime.sign_mismatch_pct);
+        end
+    else
+        fprintf('  电流符号                      : 未迭代(按基波近似, 建议给出 Rload/Lload)\n');
+    end
+    fprintf('  低次谐波 (理论应为 0) 实测/估计:\n');
+    fprintf('     h      幅值/V     8*td*fc*Vdc/(pi*h)/V\n');
+    for k = 1:size(R.deadtime.low_order_est,1)
+        fprintf('   %4d  %11.6f  %11.6f\n', R.deadtime.low_order_est(k,1), ...
+            R.deadtime.low_order_est(k,3), R.deadtime.low_order_est(k,2));
+    end
+end
 fprintf('  直流分量         : %.3e V\n', R.DC);
 fprintf('  输出有效值       : %.4f V (波形) / %.4f V (频谱, <=%g kHz)\n', ...
     R.RMS_time, R.RMS_spec, R.Kmax*R.f0/1000);

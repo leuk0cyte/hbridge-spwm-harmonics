@@ -29,15 +29,46 @@ Kmax  = 4000;        % 最高谐波次数 => 4000*50 = 200 kHz
 Rload = 0.5;         % 负载等效电阻 [ohm] (设为0则只算电压谐波)
 Lload = 2e-3;        % 负载等效电感 [H]
 
-%% ---------------------------- 2. 谐波分析 ----------------------------
+Tdead = 4e-6;        % 固定开关死区 [s]   <<< 4us; 设为 0 = 无死区
+
+%% ---------------------------- 2. 谐波分析 (含死区) ----------------------------
 R = hbridge_spwm_harmonics(fc, f0, Vdc, M, ...
-        Ncyc=Ncyc, DT=DT, Kmax=Kmax, Rload=Rload, Lload=Lload, Verbose=true);
-S = harmonic_report(R, 20); %#ok<NASGU>
+        Ncyc=Ncyc, DT=DT, Kmax=Kmax, Rload=Rload, Lload=Lload, ...
+        Tdead=Tdead, Verbose=true);
+
+% 无死区参考工况, 用于对比死区前后
+R0 = hbridge_spwm_harmonics(fc, f0, Vdc, M, ...
+        Ncyc=Ncyc, DT=DT, Kmax=Kmax, Rload=Rload, Lload=Lload, ...
+        Tdead=0, Verbose=false);
+
+S = harmonic_report(R, 20, R0); %#ok<NASGU>
 
 %% ---------------------------- 3. 导出数据 ----------------------------
-csvname = fullfile(outdir, sprintf('spectrum_fc%g_M%.2f.csv', fc, M));
+csvname = fullfile(outdir, sprintf('spectrum_fc%g_M%.2f_td%gus.csv', fc, M, Tdead*1e6));
 export_spectrum_csv(R, csvname);
 fprintf('\n  [OK] 频谱数据已导出: %s\n', csvname);
+
+% 死区前后对比表
+cmp = table((1:51).', (1:51).'*f0, R0.Amp(1:51), R.Amp(1:51), ...
+    R.Amp(1:51)-R0.Amp(1:51), ...
+    'VariableNames', {'harmonic_order','frequency_Hz','amp_no_deadtime_V', ...
+                      'amp_with_deadtime_V', 'difference_V'});
+if Tdead > 0
+    tdlist = [0 1 2 3 4 6 8 10]*1e-6;
+    A1 = zeros(size(tdlist)); A3 = zeros(size(tdlist));
+    TH50 = zeros(size(tdlist)); WTHD = zeros(size(tdlist)); THDi = zeros(size(tdlist));
+    for i = 1:numel(tdlist)
+        Rt = hbridge_spwm_harmonics(fc, f0, Vdc, M, Ncyc=2, Kmax=min(Kmax,2000), ...
+            Rload=Rload, Lload=Lload, Tdead=tdlist(i), ...
+            UseSampledFFT=false, Verbose=false);
+        A1(i) = Rt.Amp(1); A3(i) = Rt.Amp(3);
+        TH50(i) = 100*Rt.THD_50; WTHD(i) = 100*Rt.WTHD; THDi(i) = 100*Rt.THD_i_all;
+    end
+    tdTbl = table(tdlist(:)*1e6, A1(:), A3(:), 100*(1-A1(:)/(M*Vdc)), TH50(:), WTHD(:), THDi(:), ...
+        'VariableNames', {'deadtime_us','A1_V','A3_V','A1_loss_percent', ...
+                          'THD_50_percent','WTHD_percent','THD_current_percent'});
+    writetable(tdTbl, fullfile(outdir, 'thd_vs_deadtime.csv'));
+end
 
 %% ---------------------------- 4. 绘图 ----------------------------
 f1 = plot_waveforms(R);
@@ -48,6 +79,11 @@ export_fig_png(f2, fullfile(outdir, 'fig2_spectrum.png'));
 
 f3 = plot_spectrum_detail(R);
 export_fig_png(f3, fullfile(outdir, 'fig3_spectrum_detail.png'));
+
+if Tdead > 0
+    f6 = plot_deadtime_effect(R, R0);
+    export_fig_png(f6, fullfile(outdir, 'fig6_deadtime_effect.png'));
+end
 
 %% ------------------- 5. 调制比 M 扫描 (0.1 ~ 1.0) -------------------
 Mlist = 0.1:0.1:1.0;
@@ -72,6 +108,18 @@ fprintf(' DC = %.3e V   Vrms(wave) = %.4f V   Vrms(spec) = %.4f V\n', ...
 fprintf(' THD(<=50) = %.3f %%   THD(<=2fc) = %.3f %%   THD(<=%.0fkHz) = %.3f %%\n', ...
     100*R.THD_50, 100*R.THD_2fc, Kmax*f0/1000, 100*R.THD_all);
 fprintf(' WTHD = %.3f %%   THDi(<=50) = %.3f %%\n', 100*R.WTHD, 100*R.THD_i_50);
+if Tdead > 0
+    fprintf(' ---- 死区 td = %g us ----\n', Tdead*1e6);
+    fprintf(' 每载波周期平均误差电压 = %.4f V (= 2*td*fc*Vdc)\n', R.deadtime.dV_per_Tc);
+    fprintf(' 无死区 A1 = %.6f V -> 含死区 A1 = %.6f V (损失 %.4f %%)\n', ...
+        R0.Amp(1), R.Amp(1), R.A1_drop_pct);
+    fprintf(' 3/5/7 次谐波: %.2e -> %.4f / %.2e -> %.4f / %.2e -> %.4f V\n', ...
+        R0.Amp(3), R.Amp(3), R0.Amp(5), R.Amp(5), R0.Amp(7), R.Amp(7));
+    fprintf(' THD(<=50): %.3f %% -> %.3f %%   WTHD: %.3f %% -> %.3f %%\n', ...
+        100*R0.THD_50, 100*R.THD_50, 100*R0.WTHD, 100*R.WTHD);
+    fprintf(' 电流THD(<=50): %.3f %% -> %.3f %%   电流THD(全): %.3f %% -> %.3f %%\n', ...
+        100*R0.THD_i_50, 100*R.THD_i_50, 100*R0.THD_i_all, 100*R.THD_i_all);
+end
 fprintf(' 1us-FFT max rel err (significant harmonics) = %.3f %%\n', 100*R.Amp_fft_maxerr);
 fprintf(' 输出文件:\n');
 d = dir(fullfile(outdir, '*'));
