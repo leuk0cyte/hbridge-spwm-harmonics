@@ -1,0 +1,15 @@
+# ---- MATLAB 临时/自动生成文件 ----
+*.asv
+*.m~
+*.autosave
+*.slxc
+slprj/
+codegen/
+
+# ---- 运行产生的数据 (可随时重新生成; 图保留作为文档) ----
+output/*.csv
+
+# ---- 系统文件 ----
+Thumbs.db
+desktop.ini
+.DS_Store
